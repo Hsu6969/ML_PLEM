@@ -65,7 +65,7 @@ def main():
         # 階段三：資料後處理與幾何轉換 (環境: yolov8_cu12)
         # --------------------------------------------------
         # 6. 將 YOLO 的 [中心點+長寬] 轉換為主流的 [左上角+右下角] 絕對座標
-        run_script_in_env(ENV_YOLO, "convert_corners.py", WORK_DIR, EXPERIMENT_FOLDER)
+        run_script_in_env(ENV_YOLO, "convert_corner.py", WORK_DIR, EXPERIMENT_FOLDER)
         
         # 7. 從大表中把不同行人的資料獨立切分開來 (P1, P2, P3...)，存入 split_ped 資料夾
         run_script_in_env(ENV_YOLO, "split_pedestrians.py", WORK_DIR, EXPERIMENT_FOLDER)
