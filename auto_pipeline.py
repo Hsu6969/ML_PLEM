@@ -19,7 +19,7 @@ def run_script_in_env(env_name, script_name, cwd, target_folder):
 
 def main():
     # 統一設定工作目錄與虛擬環境名稱
-    WORK_DIR = r"D:\machine_learning"
+    WORK_DIR = r"D:/ML_PLEM"
     ENV_CARLA = "carla37"
     ENV_YOLO = "yolov8_cu12"
 
