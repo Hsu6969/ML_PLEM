@@ -100,8 +100,9 @@ def get_ped_location_input(input_folder, output_folder):
 
             # 輸出
             # 提取原始檔名中的 P1, P2 等 ID 資訊
-            ped_part = filename.split('_')[-1].split('.')[0] # 取得 'P1' 等字串
-            out_name = f'PLEM_input_{ped_part}.csv'
+            car_id = filename.split('_')[3] # 抓出 'Z' 或 'Y'
+            ped_id = filename.split('_')[-1].split('.')[0] # 抓出 'P1'
+            out_name = f'PLEM_input_{car_id}_{ped_id}.csv'
             new_df.to_csv(os.path.join(output_folder, out_name), index=False)
             print(f" ✅ 完成! (輸出: {out_name})")
 
@@ -110,7 +111,7 @@ if __name__ == "__main__":
         base_folder = sys.argv[1]
     else:
         # 手動測試時的路徑
-        base_folder = r'D:\CARLA_Experiments\20260317_235036'
+        base_folder = r'D:\CARLA_Experiments\20260324_004349'
 
     # 讀取上一步驟產生出來的 four_slot 資料夾
     input_folder = os.path.join(base_folder, 'four_slot_original_data')

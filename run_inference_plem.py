@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import joblib
 import tensorflow as tf
+import warnings
+warnings.filterwarnings('ignore')
 
 # 匯入你原本的自定義網路結構
 import model.loss_function_PLEM as loss_function_PLEM
@@ -83,7 +85,8 @@ def run_plem_inference(input_folder, output_folder, base_dir):
             print(f"  ⏳ 正在推論: {filename} ...", end="")
             
             # 提取行人 ID
-            ped_id = filename.split('_')[-1].split('.')[0]
+            car_id = filename.split('_')[2] # 抓出 'Z' 或 'Y'
+            ped_id = filename.split('_')[-1].split('.')[0] # 抓出 'P1'
             data_ped = pd.read_csv(os.path.join(input_folder, filename))
             
             if len(data_ped) == 0:
@@ -134,7 +137,7 @@ def run_plem_inference(input_folder, output_folder, base_dir):
             )
 
             # 輸出檔案
-            out_name = f'inference_GPS_{ped_id}.csv'
+            out_name = f'inference_GPS_{car_id}_{ped_id}.csv'
             data_ped.to_csv(os.path.join(output_folder, out_name), index=False)
             print(f" ✅ 完成! (輸出: {out_name})")
 
@@ -143,7 +146,7 @@ if __name__ == "__main__":
         base_folder = sys.argv[1]
     else:
         # 手動測試用路徑
-        base_folder = r'D:\CARLA_Experiments\20260317_235036'
+        base_folder = r'D:\CARLA_Experiments\20260324_004349'
 
     # 輸入：上一步驟產生的 PLEM_inputs 資料夾
     input_folder = os.path.join(base_folder, 'PLEM_inputs')
