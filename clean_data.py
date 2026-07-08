@@ -35,6 +35,6 @@ if __name__ == "__main__":
         TARGET_FOLDER = sys.argv[1]
     else:
         # 如果沒有 (代表你自己手動按執行的)，就用一個預設路徑方便單獨測試
-        TARGET_FOLDER = r"D:\CARLA_Experiments\default_test"
+        TARGET_FOLDER = r"D:\CARLA_Experiments\20260622_184228"
     
     clean_carla_data(TARGET_FOLDER)

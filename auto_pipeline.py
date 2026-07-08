@@ -44,7 +44,7 @@ def main():
         # 階段一：CARLA 數據收集與清理 (環境: carla37)
         # --------------------------------------------------
         # 1. 開啟 CARLA 模擬器，控制車輛與行人，收集 GPS/IMU 並拍下畫面
-        run_script_in_env(ENV_CARLA, "Precise_Vehicle_Placement_V5_2.py", WORK_DIR, EXPERIMENT_FOLDER)
+        run_script_in_env(ENV_CARLA, "Precise_Vehicle_Placement_Random.py", WORK_DIR, EXPERIMENT_FOLDER)
         
         # 2. 清理無效或殘缺的初始數據
         run_script_in_env(ENV_CARLA, "clean_data.py", WORK_DIR, EXPERIMENT_FOLDER)
