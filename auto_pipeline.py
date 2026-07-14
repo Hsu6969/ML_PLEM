@@ -26,7 +26,7 @@ def main():
     # ==================================================
     # ★ 設定你要循環自動跑幾次實驗 (例如: 1次)
     # ==================================================
-    TOTAL_LOOPS = 1
+    TOTAL_LOOPS = 10
 
     print(f"🎬 [全自動化管線啟動] 準備執行 {TOTAL_LOOPS} 次完整的資料生成與推論任務...")
 
@@ -84,6 +84,13 @@ def main():
         # --------------------------------------------------
         # 10. 載入 2024 年訓練的 H5 模型，餵入特徵進行預測，並反推回地球真實 GPS 座標，計算最終公尺誤差
         run_script_in_env(ENV_YOLO, "run_inference_plem.py", WORK_DIR, EXPERIMENT_FOLDER)
+        # ★ 階段六：產生跨車重識別訓練資料 (RQ1)
+        #    讀 inference_feedback_PLEM/ 的軌跡 -> 配對 + 時間對齊內插 + 算 5 特徵
+        #    -> 在該實驗資料夾產生 reid_features.csv
+        #    設 fatal=False：某輪若因重疊不足生不出檔案，只警告、不中斷累積
+        # --------------------------------------------------
+        # 11. 產生本輪 reid_features.csv
+        run_script_in_env(ENV_YOLO, "build_reid_dataset.py", WORK_DIR, EXPERIMENT_FOLDER)
 
         print(f"\n✅ 第 {i+1} 次循環完美結束！")
 

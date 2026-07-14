@@ -206,7 +206,7 @@ def main():
 
     sensors_tick_time = str(0.5)
     FIXED_DELTA = 0.05
-    MAX_SIM_SECONDS = 180
+    MAX_SIM_SECONDS = 60
     MAX_ATTEMPTS = 15               # 整輪重生的最大嘗試次數
 
     world = None
