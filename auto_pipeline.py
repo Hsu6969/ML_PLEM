@@ -90,7 +90,7 @@ def main():
         #    設 fatal=False：某輪若因重疊不足生不出檔案，只警告、不中斷累積
         # --------------------------------------------------
         # 11. 產生本輪 reid_features.csv
-        run_script_in_env(ENV_YOLO, "build_reid_dataset.py", WORK_DIR, EXPERIMENT_FOLDER)
+        run_script_in_env(ENV_YOLO, "build_reid_dataset_v2.py", WORK_DIR, EXPERIMENT_FOLDER)
 
         print(f"\n✅ 第 {i+1} 次循環完美結束！")
 
