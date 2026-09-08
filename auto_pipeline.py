@@ -4,19 +4,16 @@ import sys
 import time
 
 def run_script_in_env(env_name, script_name, cwd, target_folder):
-    """
-    在指定的 Conda 環境中執行 Python 腳本，並將目標資料夾路徑動態傳遞給該程式
-    """
     print(f"\n{'-'*65}")
     print(f"🚀 啟動: {script_name} (環境: {env_name})")
     
-    cmd = ["conda", "run", "--no-capture-output", "-n", env_name, "python", script_name, target_folder]
-    result = subprocess.run(cmd, cwd=cwd)
+    cmd = ["conda.bat", "run", "--no-capture-output", "-n", env_name, "python", script_name, target_folder]
+    result = subprocess.run(cmd, cwd=cwd)   # 不要加 shell=True
     
     if result.returncode != 0:
         print(f"\n❌ [錯誤] {script_name} 執行失敗！自動管線已安全中斷，保護資料不被污染。")
         sys.exit(1)
-
+        
 def main():
     # 統一設定工作目錄與虛擬環境名稱
     WORK_DIR = r"D:/ML_PLEM"
@@ -26,7 +23,7 @@ def main():
     # ==================================================
     # ★ 設定你要循環自動跑幾次實驗 (例如: 1次)
     # ==================================================
-    TOTAL_LOOPS = 10
+    TOTAL_LOOPS = 50
 
     print(f"🎬 [全自動化管線啟動] 準備執行 {TOTAL_LOOPS} 次完整的資料生成與推論任務...")
 
