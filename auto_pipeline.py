@@ -23,7 +23,7 @@ def main():
     # ==================================================
     # ★ 設定你要循環自動跑幾次實驗 (例如: 1次)
     # ==================================================
-    TOTAL_LOOPS = 50
+    TOTAL_LOOPS = 2
 
     print(f"🎬 [全自動化管線啟動] 準備執行 {TOTAL_LOOPS} 次完整的資料生成與推論任務...")
 
@@ -41,7 +41,7 @@ def main():
         # 階段一：CARLA 數據收集與清理 (環境: carla37)
         # --------------------------------------------------
         # 1. 開啟 CARLA 模擬器，控制車輛與行人，收集 GPS/IMU 並拍下畫面
-        run_script_in_env(ENV_CARLA, "Precise_Vehicle_Placement_Random.py", WORK_DIR, EXPERIMENT_FOLDER)
+        run_script_in_env(ENV_CARLA, "Precise_Vehicle_Placement_Random_v2.py", WORK_DIR, EXPERIMENT_FOLDER)
         
         # 2. 清理無效或殘缺的初始數據
         run_script_in_env(ENV_CARLA, "clean_data.py", WORK_DIR, EXPERIMENT_FOLDER)
@@ -56,7 +56,7 @@ def main():
         run_script_in_env(ENV_YOLO, "predict.py", WORK_DIR, EXPERIMENT_FOLDER)
         
         # 5. 結合視差校正與數學排序，將 YOLO 的 BBox 完美配對給正確的行人 ID (解決 ID Switch)
-        run_script_in_env(ENV_YOLO, "merge_bbox_v2.py", WORK_DIR, EXPERIMENT_FOLDER)
+        run_script_in_env(ENV_YOLO, "merge_bbox_v4.py", WORK_DIR, EXPERIMENT_FOLDER)
 
         # --------------------------------------------------
         # 階段三：資料後處理與幾何轉換 (環境: yolov8_cu12)

@@ -16,7 +16,10 @@ import model.layer_PLEM as layer_PLEM
 def vectorized_reverse_gps(ego_lat, ego_lon, ego_ori, pred_dist_norm, pred_gamma_norm):
     """使用 Numpy 極速反推預測的 GPS 經緯度"""
     R = 6371000.0  # 地球半徑 (公尺)
-    
+
+    DIST_SCALE = 1.222   # 由校正輪次 (AG1, AG2, AB1) 擬合
+    pred_dist_norm = pred_dist_norm / DIST_SCALE
+
     # 1. 還原真實距離 (m) 與 夾角 (rad)
     dist_m = pred_dist_norm * 50.0
     gamma_rad = (pred_gamma_norm * (math.pi / 2.0)) - (math.pi / 4.0)
