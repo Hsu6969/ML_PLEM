@@ -18,21 +18,19 @@ def predict_by_YOLO(image_path, save_directory):
     model.iou=0.5 # 學長車輛YOLO設定 0.5#TODO
     model.conf=0.8 # 學長車輛YOLO設定 0.7
 
-    """
-    save=True,"存預測下來的圖片"
-    """
-    result = model.predict(
+    # ★ stream=True：一次只處理一張、處理完就釋放，不會把全部原圖堆在記憶體裡
+    n_done = 0
+    for _ in model.predict(
         source=image_path,
         mode="predict",
         save=True,
         save_txt=True,
         show_labels=False,
-        project=save_directory
-    )
-    """
-    不存圖片
-    """
-    print("YOLO8 predict完成")
+        project=save_directory,
+        stream=True,
+    ):
+        n_done += 1
+    print(f"YOLO8 predict完成 (共處理 {n_done} 張)")
 
 # if __name__ == "__main__":
 

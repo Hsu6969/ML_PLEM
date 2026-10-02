@@ -20,15 +20,50 @@ gnss_data_Z, gnss_data_Y = [], []
 imu_data_Z, imu_data_Y = [], []
 pedestrians_data_list = []
 
-output_path_ego = None
+# ============================================================
+# ★ 車輛場景設定 (程式內仍沿用 Z / Y 命名，下游管線不必改)
+#   Z / Y 格式: (x, y, yaw)
+#   view_x / low_y / high_y：行人取點的範圍 (起訖分屬 low/high 兩側 -> 穿越)
+#   新增場景只要在這裡加一筆，auto_pipeline 用 --scenario 代號指定即可
+# ============================================================
+DEFAULT_SCENARIO = "AB"
+SCENARIOS = {
+    "AB": {"Z": (-67.5, 2.75, 0), "Y": (-67.5, 6.1, 0),        # 同向並排
+           "view_x": (-64.0, -54.0), "low_y": (-16.0, 1.0), "high_y": (5.0, 18.0)},
+    "AG": {"Z": (-67.5, 2.75, 0), "Y": (-51.0, -14.8, 90),     # 左側路口，視角垂直
+           "view_x": (-64.0, -54.0), "low_y": (-16.0, 1.0), "high_y": (5.0, 18.0)},
+}
 
-if len(sys.argv) > 1 and not sys.argv[-1].startswith('-'):
-    output_path_ego = sys.argv.pop(-1)
+# ★ 兩車共同可見檢查：避免行人只被其中一台車看到 (那種輪次生不出正樣本)
+CAMERA_FOV_DEG = 90.0          # CARLA RGB 相機預設水平視角
+MAX_VIEW_DIST = 45.0           # 超過這個距離 YOLO 通常偵測不到，視為看不到
+MIN_SHARED_VIS_RATIO = 0.3     # 行人路徑上至少 30% 的點要「兩車同時看得到」
+PATH_SAMPLES = 20              # 沿路徑取幾個點檢查
+
+# ============================================================
+# 參數解析：輸出資料夾 (位置參數) + --scenario
+#   例: python Precise_Vehicle_Placement_Random_v2.py --scenario AG D:\CARLA_Experiments\xxx
+# ============================================================
+_ap = argparse.ArgumentParser(description="CARLA 雙車行人資料採集")
+_ap.add_argument("output", nargs="?", default=None, help="本輪輸出資料夾")
+_ap.add_argument("--scenario", default=None, help=f"車輛場景代號: {', '.join(SCENARIOS)}")
+_ap.add_argument("--sync", action="store_true", default=True, help="Synchronous mode")
+ARGS = _ap.parse_args()
+
+SCENARIO = ARGS.scenario or DEFAULT_SCENARIO
+if SCENARIO not in SCENARIOS:
+    print(f"❌ 未知的場景代號 '{SCENARIO}'，可用: {', '.join(SCENARIOS)}")
+    sys.exit(2)
+SCN = SCENARIOS[SCENARIO]
+
+if ARGS.output:
+    output_path_ego = ARGS.output
     print(f"🔗 [自動化管線] 接收到指定資料夾路徑: {output_path_ego}")
 else:
     current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path_ego = os.path.join('D:/CARLA_Experiments', current_time_str)
     print(f"⏰ [手動執行] 自行建立時間資料夾: {output_path_ego}")
+print(f"🚗 本輪場景: {SCENARIO}")
 
 print(f"📁 本次實驗數據將儲存於: {output_path_ego}")
 
@@ -51,40 +86,45 @@ weather = carla.WeatherParameters.ClearNoon
 
 PED_BLUEPRINTS = ["walker.pedestrian.0001", "walker.pedestrian.0002", "walker.pedestrian.0003"]
 
-# ============================================================
-# ★ 車輛場景設定：改這一行就能切換兩車組合
-#   程式內仍沿用 Z / Y 命名，下游管線 (concat_v2 之後) 不必改
-#   格式: (x, y, yaw)
-# ============================================================
-SCENARIO = "AG"
-VEHICLE_POSES = {
-    "AB": {"Z": (-67.5, 2.75, 0), "Y": (-67.5, 6.1, 0)},      # 原本：同向並排
-    "AG": {"Z": (-67.5, 2.75, 0), "Y": (-51.0, -14.8, 90)},   # A + G：左側路口，視角垂直
-}
+def visible_from(pose, x, y):
+    """點 (x, y) 是否落在某台車相機的視角內、且距離不超過 MAX_VIEW_DIST。"""
+    cx, cy, yaw = pose
+    dx, dy = x - cx, y - cy
+    dist = math.hypot(dx, dy)
+    if dist < 1.0 or dist > MAX_VIEW_DIST:
+        return False
+    ang = math.degrees(math.atan2(dy, dx)) - yaw
+    ang = (ang + 180.0) % 360.0 - 180.0
+    return abs(ang) <= CAMERA_FOV_DEG / 2.0
 
-# ============================================================
-# ★ 視野帶：只保留落在「兩車前方鏡頭範圍」的導航點
-#   (兩車在 x≈-67.5、朝 +x；行人在其前方 x≈-64~-54 一帶穿越馬路)
-#   低側 / 高側 中間留空 (車輛所在的 y≈2~5)，讓行人真的「穿越」過鏡頭
-# ============================================================
-VIEW_X_MIN, VIEW_X_MAX = -64.0, -54.0
-LOW_Y_MIN, LOW_Y_MAX = -16.0, 1.0     # 馬路下側 (人行道/穿越起點)
-HIGH_Y_MIN, HIGH_Y_MAX = 5.0, 18.0    # 馬路上側
+
+def shared_visibility(start, dest):
+    """沿起點->終點直線取樣，回傳『兩車同時看得到』的比例 (0~1)。
+       註：以直線近似實際行走路徑，且未考慮遮蔽，只作為粗篩。"""
+    hits = 0
+    for k in range(PATH_SAMPLES):
+        t = k / (PATH_SAMPLES - 1)
+        x = start.x + (dest.x - start.x) * t
+        y = start.y + (dest.y - start.y) * t
+        if visible_from(SCN["Z"], x, y) and visible_from(SCN["Y"], x, y):
+            hits += 1
+    return hits / PATH_SAMPLES
 
 
 def sample_nav_points(world, need_each, max_samples=6000):
-    """反覆向 CARLA 行人導航網格要位置，只保留落在視野帶的點，
+    """反覆向 CARLA 行人導航網格要位置，只保留落在本場景視野帶的點，
        分成低側/高側兩組回傳 (保證都在網格上、行人一定能走)。"""
+    (x_min, x_max), (ly_min, ly_max), (hy_min, hy_max) = SCN["view_x"], SCN["low_y"], SCN["high_y"]
     low, high = [], []
     for _ in range(max_samples):
         loc = world.get_random_location_from_navigation()
         if loc is None:
             continue
-        if not (VIEW_X_MIN <= loc.x <= VIEW_X_MAX):
+        if not (x_min <= loc.x <= x_max):
             continue
-        if LOW_Y_MIN <= loc.y <= LOW_Y_MAX:
+        if ly_min <= loc.y <= ly_max:
             low.append(loc)
-        elif HIGH_Y_MIN <= loc.y <= HIGH_Y_MAX:
+        elif hy_min <= loc.y <= hy_max:
             high.append(loc)
         if len(low) >= need_each and len(high) >= need_each:
             break
@@ -92,33 +132,44 @@ def sample_nav_points(world, need_each, max_samples=6000):
 
 
 def make_pedestrian_configs_nav(world, n=3):
-    """用導航網格點，生成 n 位『穿越馬路(上下向)』的行人配置。
+    """用導航網格點，生成 n 位『穿越馬路』且『兩車都看得到』的行人配置。
        起點/終點分屬低側與高側 -> 穿越；方向隨機 -> 不同人常走相反向。
-       導航點不足時回傳 None，交由外層整輪重試。"""
-    low, high = sample_nav_points(world, need_each=n + 2)
-    if len(low) < n or len(high) < n:
-        print(f"   ⚠️ 視野帶內導航點不足 (低側 {len(low)} / 高側 {len(high)}，需各 {n})")
-        return None
-
+       不足 n 位時回傳 None，交由外層整輪重試。"""
+    low, high = sample_nav_points(world, need_each=n * 4)
     random.shuffle(low)
     random.shuffle(high)
+
     configs = []
-    for i in range(n):
+    for i in range(min(len(low), len(high))):
         if random.random() < 0.5:
             start, dest = low[i], high[i]        # 由下往上穿越
         else:
             start, dest = high[i], low[i]        # 由上往下穿越
+        ratio = shared_visibility(start, dest)
+        if ratio < MIN_SHARED_VIS_RATIO:
+            continue                             # 兩車共同可見太少，不要這條路徑
+        k = len(configs)
         configs.append({
-            "id": f"P{i + 1}",
-            "Ped_blueprint_ID": PED_BLUEPRINTS[i],
+            "id": f"P{k + 1}",
+            "Ped_blueprint_ID": PED_BLUEPRINTS[k],
             "spawn_loc": carla.Location(x=start.x, y=start.y, z=1.0),
             "destination": carla.Location(x=dest.x, y=dest.y, z=dest.z),
             "speed": round(random.uniform(1.0, 2.0), 1),
+            "shared_vis": ratio,
         })
+        if len(configs) == n:
+            break
+
+    if len(configs) < n:
+        print(f"   ⚠️ 符合『兩車共同可見』的路徑不足 (找到 {len(configs)} / 需 {n})，"
+              f"低側點 {len(low)}、高側點 {len(high)}")
+        return None
+
     print("🚶 本輪行人配置 (導航網格點):")
     for c in configs:
         print(f"   {c['id']}: ({c['spawn_loc'].x:.1f},{c['spawn_loc'].y:.1f}) → "
-              f"({c['destination'].x:.1f},{c['destination'].y:.1f}), speed={c['speed']}")
+              f"({c['destination'].x:.1f},{c['destination'].y:.1f}), speed={c['speed']}, "
+              f"兩車共同可見 {c['shared_vis']*100:.0f}%")
     return configs
 
 
@@ -204,9 +255,7 @@ def sensor_callback(sensor_data, sensor_queue, sensor_name):
 
 
 def parser():
-    argparser = argparse.ArgumentParser(description=__doc__)
-    argparser.add_argument('--sync', action='store_true', default=True, help='Synchronous mode')
-    return argparser.parse_args()
+    return ARGS   # 參數已在檔案開頭解析 (輸出資料夾 + --scenario + --sync)
 
 
 def main():
@@ -249,7 +298,7 @@ def main():
                 synchronous_master = True
 
         # === 兩台 (靜止) 車輛：位置由 SCENARIO 決定 ===
-        poses = VEHICLE_POSES[SCENARIO]
+        poses = SCN
         zx, zy, zyaw = poses["Z"]
         yx, yy, yyaw = poses["Y"]
         print(f"🚗 場景 {SCENARIO}: Z=({zx},{zy},yaw={zyaw})  Y=({yx},{yy},yaw={yyaw})")
@@ -264,7 +313,8 @@ def main():
 
         # 記錄場景標籤，之後合併資料時可分場景統計
         with open(os.path.join(output_path_ego, 'scenario.txt'), 'w', encoding='utf-8') as f:
-            f.write(f"{SCENARIO}\nZ={poses['Z']}\nY={poses['Y']}\n")
+            f.write(f"{SCENARIO}\nZ={poses['Z']}\nY={poses['Y']}\n"
+                    f"view_x={poses['view_x']}\nlow_y={poses['low_y']}\nhigh_y={poses['high_y']}\n")
 
         # === 行人：導航網格取點 + 暖身驗證 + 整輪重生 ===
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -278,8 +328,9 @@ def main():
             active_pedestrians = []
 
         if not active_pedestrians:
-            raise RuntimeError("多次嘗試後仍無法生成可正常行走的行人；"
-                               "請確認 VIEW_X / LOW_Y / HIGH_Y 範圍有落在行人導航網格上。")
+            raise RuntimeError(f"[{SCENARIO}] 多次嘗試後仍無法生成『會走且兩車都看得到』的行人；"
+                               "請確認 SCENARIOS 裡該場景的 view_x / low_y / high_y 範圍，"
+                               "或放寬 MIN_SHARED_VIS_RATIO / MAX_VIEW_DIST。")
 
         # === 感測器 (兩車相同 tick，維持同步) ===
         sensor_queue = Queue()
