@@ -27,11 +27,18 @@ pedestrians_data_list = []
 #   新增場景只要在這裡加一筆，auto_pipeline 用 --scenario 代號指定即可
 # ============================================================
 DEFAULT_SCENARIO = "AB"
+
+_CROSSWALK = {"view_x": (-64.0, -54.0), "low_y": (-16.0, 1.0), "high_y": (5.0, 18.0)}
+
 SCENARIOS = {
-    "AB": {"Z": (-67.5, 2.75, 0), "Y": (-67.5, 6.1, 0),        # 同向並排
-           "view_x": (-64.0, -54.0), "low_y": (-16.0, 1.0), "high_y": (5.0, 18.0)},
-    "AG": {"Z": (-67.5, 2.75, 0), "Y": (-51.0, -14.8, 90),     # 左側路口，視角垂直
-           "view_x": (-64.0, -54.0), "low_y": (-16.0, 1.0), "high_y": (5.0, 18.0)},
+    # 南側同向並排，距行人約 7 m
+    "AB": {"Z": (-67.5, 2.75, 0),     "Y": (-67.5, 6.1, 0),      **_CROSSWALK},
+    # 右上方，朝 -y，距行人約 23.6 / 21.2 m
+    "CD": {"Z": (-43.5, 19.1, -90),   "Y": (-47.0, 19.1, -90),   **_CROSSWALK},
+    # 對向 (朝 -x)，距行人約 28.1 / 27.5 m
+    "EF": {"Z": (-33.25, -4.2, 180),  "Y": (-33.25, -1.0, 180),  **_CROSSWALK},
+    # 左下方，朝 +y，距行人約 20.0 / 18.5 m
+    "GH": {"Z": (-51.0, -14.8, 90),   "Y": (-54.75, -14.8, 90),  **_CROSSWALK},
 }
 
 # ★ 兩車共同可見檢查：避免行人只被其中一台車看到 (那種輪次生不出正樣本)
@@ -277,7 +284,33 @@ def main():
     try:
         client = carla.Client('localhost', 2000)
         client.set_timeout(60.0)
-        world = client.load_world(town)
+        # ★ 地圖已是 Town05_Opt 就沿用，不每輪重新 load_world (重複載入地圖是 CARLA 記憶體累積的主因之一)
+        world = client.get_world()
+        if not world.get_map().name.endswith(town):
+            print(f"🗺️ 載入地圖 {town} ...")
+            world = client.load_world(town)
+        else:
+            print(f"🗺️ 沿用已載入的地圖 {town}，清除上一輪可能殘留的實體...")
+            s0 = world.get_settings()
+            if s0.synchronous_mode:          # 上一輪若異常結束，世界可能還卡在同步模式
+                s0.synchronous_mode = False
+                s0.fixed_delta_seconds = None
+                world.apply_settings(s0)
+            actors = world.get_actors()
+            ctrls = [a for a in actors if a.type_id.startswith("controller.ai.walker")]
+            for c in ctrls:
+                try:
+                    c.stop()
+                except Exception:
+                    pass
+            leftovers = (ctrls
+                         + [a for a in actors if a.type_id.startswith("sensor.")]
+                         + [a for a in actors if a.type_id.startswith("walker.")]
+                         + [a for a in actors if a.type_id.startswith("vehicle.")])
+            if leftovers:
+                client.apply_batch_sync([carla.command.DestroyActor(a) for a in leftovers])
+                print(f"   清除殘留實體 {len(leftovers)} 個")
+            world.wait_for_tick()
         world.unload_map_layer(carla.MapLayer.ParkedVehicles)
         carla_map = world.get_map()
         origin_settings = world.get_settings()
