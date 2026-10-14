@@ -21,15 +21,15 @@ COLLECT_SCRIPT = "Precise_Vehicle_Placement_Random_v2.py"
 
 # ★ 每個場景要跑幾輪 (場景代號必須存在於採集程式的 SCENARIOS 裡)
 SCENARIO_ROUNDS = {
-    "AB": 25,
-    "CD": 25,
-    "EF": 25,
-    "GH": 25,
+    "AB": 30,
+    "CD": 30,
+    "EF": 30,
+    "GH": 30,
 }
 
 # True ：場景交錯跑 ，中途 CARLA 掛掉時每個場景都已有資料
 # False：一個場景跑完再跑下一個
-INTERLEAVE = True
+INTERLEAVE = False
 
 # ★ CARLA 自動重啟 (解決跑到一半 CARLA 崩潰、之後每輪都 time-out 的問題)
 CARLA_EXE = r"D:\CARLA_0.9.15\WindowsNoEditor\CarlaUE4.exe"   # ← 改成你的 CarlaUE4.exe 完整路徑
@@ -359,7 +359,11 @@ def main():
 
             try:
                 # 1. 採集：多傳 --scenario；資料夾放最後
-                run_script(ENV_CARLA, COLLECT_SCRIPT, ["--scenario", sc, EXPERIMENT_FOLDER])
+                # ★ route-seed = 此場景第幾個成功輪次：每個場景的第 k 輪都用同一組行人軌跡 (控制變因)
+                #   失敗重試沿用同一個 seed，確保各場景成功的輪次一一對應
+                route_seed = len(results[sc]["ok"]) + 1
+                run_script(ENV_CARLA, COLLECT_SCRIPT,
+                ["--scenario", sc, "--route-seed", str(route_seed), EXPERIMENT_FOLDER])
                 # 2~11. 後處理
                 for env_name, script_name in POST_STEPS:
                     run_script(env_name, script_name, [EXPERIMENT_FOLDER])

@@ -11,6 +11,8 @@ from haversine import haversine
 import time
 from datetime import datetime
 import sys
+import numpy as np
+import cv2
 
 # ============================================================
 # 全域資料容器
@@ -21,31 +23,47 @@ imu_data_Z, imu_data_Y = [], []
 pedestrians_data_list = []
 
 # ============================================================
-# ★ 車輛場景設定 (程式內仍沿用 Z / Y 命名，下游管線不必改)
-#   Z / Y 格式: (x, y, yaw)
-#   view_x / low_y / high_y：行人取點的範圍 (起訖分屬 low/high 兩側 -> 穿越)
-#   新增場景只要在這裡加一筆，auto_pipeline 用 --scenario 代號指定即可
+# ★ 車輛場景設定 (程式內仍沿用 Z / Y 命名：代號第 1 個字母 = Z 車，第 2 個 = Y 車)
+#   格式: (x, y, yaw)；實驗變因只有兩車位置，行人路徑四組完全相同
 # ============================================================
 DEFAULT_SCENARIO = "AB"
-
-_CROSSWALK = {"view_x": (-64.0, -54.0), "low_y": (-16.0, 1.0), "high_y": (5.0, 18.0)}
-
 SCENARIOS = {
-    # 南側同向並排，距行人約 7 m
-    "AB": {"Z": (-67.5, 2.75, 0),     "Y": (-67.5, 6.1, 0),      **_CROSSWALK},
-    # 右上方，朝 -y，距行人約 23.6 / 21.2 m
-    "CD": {"Z": (-43.5, 19.1, -90),   "Y": (-47.0, 19.1, -90),   **_CROSSWALK},
-    # 對向 (朝 -x)，距行人約 28.1 / 27.5 m
-    "EF": {"Z": (-33.25, -4.2, 180),  "Y": (-33.25, -1.0, 180),  **_CROSSWALK},
-    # 左下方，朝 +y，距行人約 20.0 / 18.5 m
-    "GH": {"Z": (-51.0, -14.8, 90),   "Y": (-54.75, -14.8, 90),  **_CROSSWALK},
+    "AB": {"Z": (-67.5, 2.75, 0),    "Y": (-67.5, 6.1, 0)},        # 南側同向並排
+    "CD": {"Z": (-43.5, 19.1, -90),  "Y": (-47.0, 19.1, -90)},     # 右上方，朝 -y
+    "EF": {"Z": (-33.25, -4.2, 180), "Y": (-33.25, -1.0, 180)},    # 對向，朝 -x
+    "GH": {"Z": (-51.0, -14.8, 90),  "Y": (-54.75, -14.8, 90)},    # 左下方，朝 +y
 }
 
-# ★ 兩車共同可見檢查：避免行人只被其中一台車看到 (那種輪次生不出正樣本)
-CAMERA_FOV_DEG = 90.0          # CARLA RGB 相機預設水平視角
-MAX_VIEW_DIST = 45.0           # 超過這個距離 YOLO 通常偵測不到，視為看不到
-MIN_SHARED_VIS_RATIO = 0.3     # 行人路徑上至少 30% 的點要「兩車同時看得到」
-PATH_SAMPLES = 20              # 沿路徑取幾個點檢查
+# ============================================================
+# ★ 固定行人路徑 (不使用 AI 控制器，改用 WalkerControl 直接走直線)
+#   - AI 控制器遇到其他行人會自動避讓、停頓數秒，這是之前「走一半停下來」的原因；
+#     直接控制則每個行人以固定速度沿固定路線走，不會互相避讓或停頓。
+#   - 三條路線在 x 方向錯開 1.2 m (互不碰撞)，並以出發延遲錯開時間。
+#   - waypoints: 依序經過的點 (x, y)；可加中間點做轉彎
+#   - delay: 錄影開始後幾秒才出發；speed: 公尺/秒
+# ============================================================
+FIXED_ROUTES = [
+    {"id": "P1", "bp": "walker.pedestrian.0001", "waypoints": [(-61.4, -10.5), (-61.4, 12.5)],
+     "speed": 1.30, "delay": 0.0},  # 由下往上
+    {"id": "P2", "bp": "walker.pedestrian.0002", "waypoints": [(-60.4, 15.0), (-60.4, -8.5)],
+     "speed": 1.20, "delay": 0.0},  # 由上往下 (方向相反的負樣本)
+    {"id": "P3", "bp": "walker.pedestrian.0003", "waypoints": [(-59.4, -10.5), (-59.4, 11.5)],
+     "speed": 1.35, "delay": 0.5},  # ★ 困難案例：與 P1 同方向、幾乎同時出發、相隔約 2 m 並排走
+]
+
+# --route-seed > 0 時，每輪對固定路線加入小幅擾動，避免多輪資料完全相同；
+# 同一個 route-seed 在四個場景產生「完全相同」的行人軌跡 (控制變因)。
+JITTER = {"lane_x": 0.1, "end_y": 0.5, "speed": 0.1, "delay": 1.0}
+ARRIVE_DIST = 0.4      # 距離航點多近算抵達 (m)
+STUCK_SECONDS = 4.0    # 行進中連續這麼久位移 < 0.3 m 視為卡住 (已嘗試跳上台階仍失敗)
+# ★ 台階輔助：直接控制的行人「往下走台階」沒問題，但「往上跨人行道台階」常會卡住，
+#   偵測到前進受阻時自動做一次小跳躍跨上去 (同步模式下仍是確定性的，各場景結果一致)
+STEP_CHECK_SEC = 0.4   # 每隔多久檢查一次前進量
+STEP_MIN_RATIO = 0.35  # 實際位移 < 應走距離的 35% 視為被台階擋住
+JUMP_COOLDOWN = 1.0    # 兩次跨步至少間隔幾秒
+STEP_UP_HEIGHT = 0.25  # ★ 跨上台階時往上抬的高度 (m)；人行道台階約 0.15~0.2 m
+STEP_UP_FORWARD = 0.35 # ★ 同時往前移的距離 (m)，約半步
+SAVE_SIZE = 1280  
 
 # ============================================================
 # 參數解析：輸出資料夾 (位置參數) + --scenario
@@ -54,6 +72,8 @@ PATH_SAMPLES = 20              # 沿路徑取幾個點檢查
 _ap = argparse.ArgumentParser(description="CARLA 雙車行人資料採集")
 _ap.add_argument("output", nargs="?", default=None, help="本輪輸出資料夾")
 _ap.add_argument("--scenario", default=None, help=f"車輛場景代號: {', '.join(SCENARIOS)}")
+_ap.add_argument("--route-seed", type=int, default=0,
+                 help="行人路徑擾動種子：0 = 完全使用基準固定路徑；相同種子在各場景產生相同軌跡")
 _ap.add_argument("--sync", action="store_true", default=True, help="Synchronous mode")
 ARGS = _ap.parse_args()
 
@@ -74,11 +94,8 @@ print(f"🚗 本輪場景: {SCENARIO}")
 
 print(f"📁 本次實驗數據將儲存於: {output_path_ego}")
 
-# ★ 每輪不同亂數種子 (用時間戳)：每輪配置不同，又能靠種子重現
-_digits = "".join(re.findall(r"\d", os.path.basename(output_path_ego)))
-_seed = int(_digits[-9:]) if _digits else int(time.time())
-random.seed(_seed)
-print(f"🎲 本輪亂數種子: {_seed}")
+ROUTE_SEED = ARGS.route_seed
+print(f"🛣️ 行人路徑種子: {ROUTE_SEED} ({'基準固定路徑' if ROUTE_SEED == 0 else '固定路徑 + 小幅擾動'})")
 
 if not os.path.exists(output_path_ego):
     os.makedirs(output_path_ego)
@@ -91,165 +108,150 @@ os.makedirs(output_path_image_Y, exist_ok=True)
 town = 'Town05_Opt'
 weather = carla.WeatherParameters.ClearNoon
 
-PED_BLUEPRINTS = ["walker.pedestrian.0001", "walker.pedestrian.0002", "walker.pedestrian.0003"]
-
-def visible_from(pose, x, y):
-    """點 (x, y) 是否落在某台車相機的視角內、且距離不超過 MAX_VIEW_DIST。"""
-    cx, cy, yaw = pose
-    dx, dy = x - cx, y - cy
-    dist = math.hypot(dx, dy)
-    if dist < 1.0 or dist > MAX_VIEW_DIST:
-        return False
-    ang = math.degrees(math.atan2(dy, dx)) - yaw
-    ang = (ang + 180.0) % 360.0 - 180.0
-    return abs(ang) <= CAMERA_FOV_DEG / 2.0
-
-
-def shared_visibility(start, dest):
-    """沿起點->終點直線取樣，回傳『兩車同時看得到』的比例 (0~1)。
-       註：以直線近似實際行走路徑，且未考慮遮蔽，只作為粗篩。"""
-    hits = 0
-    for k in range(PATH_SAMPLES):
-        t = k / (PATH_SAMPLES - 1)
-        x = start.x + (dest.x - start.x) * t
-        y = start.y + (dest.y - start.y) * t
-        if visible_from(SCN["Z"], x, y) and visible_from(SCN["Y"], x, y):
-            hits += 1
-    return hits / PATH_SAMPLES
-
-
-def sample_nav_points(world, need_each, max_samples=6000):
-    """反覆向 CARLA 行人導航網格要位置，只保留落在本場景視野帶的點，
-       分成低側/高側兩組回傳 (保證都在網格上、行人一定能走)。"""
-    (x_min, x_max), (ly_min, ly_max), (hy_min, hy_max) = SCN["view_x"], SCN["low_y"], SCN["high_y"]
-    low, high = [], []
-    for _ in range(max_samples):
-        loc = world.get_random_location_from_navigation()
-        if loc is None:
-            continue
-        if not (x_min <= loc.x <= x_max):
-            continue
-        if ly_min <= loc.y <= ly_max:
-            low.append(loc)
-        elif hy_min <= loc.y <= hy_max:
-            high.append(loc)
-        if len(low) >= need_each and len(high) >= need_each:
-            break
-    return low, high
-
-
-def make_pedestrian_configs_nav(world, n=3):
-    """用導航網格點，生成 n 位『穿越馬路』且『兩車都看得到』的行人配置。
-       起點/終點分屬低側與高側 -> 穿越；方向隨機 -> 不同人常走相反向。
-       不足 n 位時回傳 None，交由外層整輪重試。"""
-    low, high = sample_nav_points(world, need_each=n * 4)
-    random.shuffle(low)
-    random.shuffle(high)
-
-    configs = []
-    for i in range(min(len(low), len(high))):
-        if random.random() < 0.5:
-            start, dest = low[i], high[i]        # 由下往上穿越
-        else:
-            start, dest = high[i], low[i]        # 由上往下穿越
-        ratio = shared_visibility(start, dest)
-        if ratio < MIN_SHARED_VIS_RATIO:
-            continue                             # 兩車共同可見太少，不要這條路徑
-        k = len(configs)
-        configs.append({
-            "id": f"P{k + 1}",
-            "Ped_blueprint_ID": PED_BLUEPRINTS[k],
-            "spawn_loc": carla.Location(x=start.x, y=start.y, z=1.0),
-            "destination": carla.Location(x=dest.x, y=dest.y, z=dest.z),
-            "speed": round(random.uniform(1.0, 2.0), 1),
-            "shared_vis": ratio,
-        })
-        if len(configs) == n:
-            break
-
-    if len(configs) < n:
-        print(f"   ⚠️ 符合『兩車共同可見』的路徑不足 (找到 {len(configs)} / 需 {n})，"
-              f"低側點 {len(low)}、高側點 {len(high)}")
-        return None
-
-    print("🚶 本輪行人配置 (導航網格點):")
-    for c in configs:
-        print(f"   {c['id']}: ({c['spawn_loc'].x:.1f},{c['spawn_loc'].y:.1f}) → "
-              f"({c['destination'].x:.1f},{c['destination'].y:.1f}), speed={c['speed']}, "
-              f"兩車共同可見 {c['shared_vis']*100:.0f}%")
-    return configs
+def make_fixed_routes(route_seed):
+    """回傳本輪 3 位行人的路線；route_seed 相同 -> 路線完全相同 (與場景無關)。"""
+    rng = random.Random(route_seed)
+    routes = []
+    for r in FIXED_ROUTES:
+        wps = list(r["waypoints"])
+        speed, delay = r["speed"], r["delay"]
+        if route_seed > 0:
+            dx = rng.uniform(-JITTER["lane_x"], JITTER["lane_x"])          # 整條路線平移 (保持車道錯開)
+            dy0 = rng.uniform(-JITTER["end_y"], JITTER["end_y"])
+            dy1 = rng.uniform(-JITTER["end_y"], JITTER["end_y"])
+            wps = [(x + dx, y) for x, y in wps]
+            wps[0] = (wps[0][0], wps[0][1] + dy0)
+            wps[-1] = (wps[-1][0], wps[-1][1] + dy1)
+            speed = round(speed + rng.uniform(-JITTER["speed"], JITTER["speed"]), 2)
+            delay = max(0.0, round(delay + rng.uniform(-JITTER["delay"], JITTER["delay"]), 2))
+        routes.append({"id": r["id"], "bp": r["bp"], "waypoints": wps, "speed": speed, "delay": delay})
+    print("🚶 本輪行人固定路徑:")
+    for r in routes:
+        path = " → ".join(f"({x:.1f},{y:.1f})" for x, y in r["waypoints"])
+        print(f"   {r['id']}: {path}  speed={r['speed']} m/s  delay={r['delay']} s")
+    return routes
 
 
 def _destroy_peds(active):
     for p in active:
         try:
-            if p.get("ai_controller") is not None:
-                p["ai_controller"].stop()
-                p["ai_controller"].destroy()
             if p.get("actor") is not None:
                 p["actor"].destroy()
         except Exception:
             pass
 
 
-def spawn_and_validate_pedestrians(world, blueprint_library, configs,
-                                   warmup_ticks=20, move_thresh=0.3):
-    """生成行人 + AI，暖身數個 tick 確認『每個行人真的有在動』。
-       任一個沒動或生成失敗 -> 清掉全部並回傳 None (整輪重生)。"""
-    walker_ai_bp = blueprint_library.find('controller.ai.walker')
+def spawn_fixed_pedestrians(world, blueprint_library, routes):
+    """在路線起點生成行人 (不加 AI 控制器)；任一人生成失敗就丟出錯誤。"""
     active = []
-
-    for config in configs:
-        ped_bp = blueprint_library.find(config["Ped_blueprint_ID"])
-        if ped_bp.has_attribute('is_invincible'):
-            ped_bp.set_attribute('is_invincible', 'true')
-        ped_actor = world.try_spawn_actor(ped_bp, carla.Transform(config["spawn_loc"]))
-        if ped_actor is None:
-            print(f"   ✗ {config['id']} 生成失敗")
+    for r in routes:
+        bp = blueprint_library.find(r["bp"])
+        if bp.has_attribute('is_invincible'):
+            bp.set_attribute('is_invincible', 'true')
+        (x0, y0), (x1, y1) = r["waypoints"][0], r["waypoints"][1]
+        yaw = math.degrees(math.atan2(y1 - y0, x1 - x0))     # 一開始就面向前進方向
+        actor, used = None, None
+        L = math.hypot(x1 - x0, y1 - y0)
+        ux, uy = (x1 - x0) / L, (y1 - y0) / L               # 前進方向
+        px, py = -uy, ux                                    # 左右方向
+        # 依序嘗試：沿路線往前 0~4 m、左右偏移 0 / ±0.3 m、高度 1.0 / 1.5 m
+        for fwd in [i * 0.5 for i in range(9)]:
+            for lat in (0.0, 0.3, -0.3):
+                sx, sy = x0 + ux * fwd + px * lat, y0 + uy * fwd + py * lat
+                for z in (1.0, 1.5):
+                    actor = world.try_spawn_actor(bp, carla.Transform(carla.Location(x=sx, y=sy, z=z),
+                                                                      carla.Rotation(yaw=yaw)))
+                    if actor is not None:
+                        used = (sx, sy)
+                        break
+                if actor: break
+            if actor: break
+        if actor is None:
             _destroy_peds(active)
-            return None
-        ai = world.try_spawn_actor(walker_ai_bp, carla.Transform(), attach_to=ped_actor)
-        if ai is None:
-            print(f"   ✗ {config['id']} AI 控制器生成失敗")
-            ped_actor.destroy()
-            _destroy_peds(active)
-            return None
-        active.append({"name": config["id"], "actor": ped_actor, "ai_controller": ai,
-                       "destination": config["destination"], "speed": config["speed"],
-                       "is_finished": False})
-
-    world.tick()  # 讓實體確實存在
-    start_locs = {p["name"]: p["actor"].get_location() for p in active}
-
-    for p in active:
-        p["ai_controller"].start()
-        p["ai_controller"].set_max_speed(p["speed"])
-        p["ai_controller"].go_to_location(p["destination"])
-
-    # 暖身：確認每個行人真的有位移 (沒動的話代表卡住/走不了)
-    for _ in range(warmup_ticks):
+            raise RuntimeError(f"行人 {r['id']} 在起點 ({x0:.1f},{y0:.1f}) 附近 4 m 內都無法生成；"
+                               "請先執行 probe_walkable.py 查看可行走範圍，再調整 FIXED_ROUTES")
+        if math.hypot(used[0] - x0, used[1] - y0) > 0.01:
+            print(f"   ⚠️ {r['id']} 原起點 ({x0:.1f},{y0:.1f}) 被擋住，改從 ({used[0]:.1f},{used[1]:.1f}) 出發")
+            r["waypoints"][0] = used
+        active.append({"name": r["id"], "actor": actor, "waypoints": r["waypoints"],
+                       "wp_idx": 1, "speed": r["speed"], "delay": r["delay"],
+                       "is_finished": False, "last_pos": None, "still_since": None,
+                       "chk_pos": None, "chk_time": None, "last_jump": -99.0, "n_jumps": 0})
+    # 讓行人落地站穩
+    for _ in range(10):
         world.tick()
-
-    for p in active:
-        now = p["actor"].get_location()
-        s = start_locs[p["name"]]
-        moved = math.sqrt((now.x - s.x) ** 2 + (now.y - s.y) ** 2)
-        if moved < move_thresh:
-            print(f"   ✗ {p['name']} 暖身 {warmup_ticks} tick 幾乎沒動 (moved={moved:.2f}m) -> 整輪重生")
-            _destroy_peds(active)
-            return None
-
-    print("   ✓ 三位行人都確認會走")
+    print(f"   ✓ 已生成 {len(active)} 位行人 (直接控制，不使用 AI 避讓)")
     return active
 
+
+def stop_walker(p):
+    p["actor"].apply_control(carla.WalkerControl(direction=carla.Vector3D(0, 0, 0),
+                                                 speed=0.0, jump=False))
+
+
+def update_walkers(active, sim_time):
+    """每個 tick 呼叫：讓每位行人朝下一個航點以固定速度直線前進。"""
+    for p in active:
+        if p["is_finished"]:
+            continue
+        if sim_time < p["delay"]:
+            stop_walker(p)                       # 還沒到出發時間，原地等待
+            continue
+        loc = p["actor"].get_location()
+        tx, ty = p["waypoints"][p["wp_idx"]]
+        dx, dy = tx - loc.x, ty - loc.y
+        dist = math.hypot(dx, dy)
+        if dist < ARRIVE_DIST:
+            if p["wp_idx"] < len(p["waypoints"]) - 1:
+                p["wp_idx"] += 1                 # 前往下一個航點
+                continue
+            stop_walker(p)
+            p["is_finished"] = True
+            print(f"🚦 行人 {p['name']} 已抵達終點，停止移動。")
+            continue
+        # ★ 台階輔助：前進量明顯不足 -> 把行人往前、往上微移一小步，模擬「跨上」台階
+        #   (CARLA 的 jump 高度固定且很高，改用小幅位移，看起來像正常走上人行道)
+        if p["chk_pos"] is None:
+            p["chk_pos"], p["chk_time"] = (loc.x, loc.y), sim_time
+        elif sim_time - p["chk_time"] >= STEP_CHECK_SEC:
+            moved = math.hypot(loc.x - p["chk_pos"][0], loc.y - p["chk_pos"][1])
+            expected = p["speed"] * (sim_time - p["chk_time"])
+            if moved < STEP_MIN_RATIO * expected and sim_time - p["last_jump"] >= JUMP_COOLDOWN:
+                p["actor"].set_location(carla.Location(
+                    x=loc.x + dx / dist * STEP_UP_FORWARD,
+                    y=loc.y + dy / dist * STEP_UP_FORWARD,
+                    z=loc.z + STEP_UP_HEIGHT))
+                p["last_jump"] = sim_time
+                p["n_jumps"] += 1
+                print(f"   ↑ 行人 {p['name']} 在 ({loc.x:.1f},{loc.y:.1f}) 前進受阻，跨上台階 (第 {p['n_jumps']} 次)")
+            p["chk_pos"], p["chk_time"] = (loc.x, loc.y), sim_time
+
+        p["actor"].apply_control(carla.WalkerControl(
+            direction=carla.Vector3D(dx / dist, dy / dist, 0.0), speed=p["speed"], jump=False))
+
+        # 卡住偵測：跳了仍長時間幾乎沒位移 -> 視為被擋住，結束此行人
+        if p["last_pos"] is None or math.hypot(loc.x - p["last_pos"][0], loc.y - p["last_pos"][1]) > 0.3:
+            p["last_pos"], p["still_since"] = (loc.x, loc.y), sim_time
+        elif sim_time - p["still_since"] > STUCK_SECONDS:
+            stop_walker(p)
+            p["is_finished"] = True
+            print(f"⚠️ 行人 {p['name']} 在 ({loc.x:.1f},{loc.y:.1f}) 卡住超過 {STUCK_SECONDS} 秒，"
+                  "提前結束此行人 (請檢查該路線是否有障礙物)")
+
+def save_resized(image, path):
+    """把 CARLA 影像 (BGRA) 縮成 SAVE_SIZE x SAVE_SIZE 後存成 PNG。"""
+    arr = np.frombuffer(image.raw_data, dtype=np.uint8).reshape(image.height, image.width, 4)[:, :, :3]
+    if image.width != SAVE_SIZE:
+        arr = cv2.resize(np.ascontiguousarray(arr), (SAVE_SIZE, SAVE_SIZE), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(path, arr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
 def sensor_callback(sensor_data, sensor_queue, sensor_name):
     global image_count
     if sensor_name == 'camera_Z':
         image_count += 1
-        sensor_data.save_to_disk(os.path.join(output_path_image_Z, '%06d.png' % sensor_data.frame))
+        save_resized(sensor_data, os.path.join(output_path_image_Z, '%06d.png' % sensor_data.frame))
     elif sensor_name == 'camera_Y':
-        sensor_data.save_to_disk(os.path.join(output_path_image_Y, '%06d.png' % sensor_data.frame))
+        save_resized(sensor_data, os.path.join(output_path_image_Y, '%06d.png' % sensor_data.frame))
     elif sensor_name == 'gnss_Z':
         gnss_data_Z.append([sensor_data.longitude, sensor_data.latitude])
     elif sensor_name == 'gnss_Y':
@@ -274,7 +276,6 @@ def main():
     sensors_tick_time = str(0.5)
     FIXED_DELTA = 0.05
     MAX_SIM_SECONDS = 40
-    MAX_ATTEMPTS = 15               # 整輪重生的最大嘗試次數
 
     world = None
     client = None
@@ -346,24 +347,14 @@ def main():
 
         # 記錄場景標籤，之後合併資料時可分場景統計
         with open(os.path.join(output_path_ego, 'scenario.txt'), 'w', encoding='utf-8') as f:
-            f.write(f"{SCENARIO}\nZ={poses['Z']}\nY={poses['Y']}\n"
-                    f"view_x={poses['view_x']}\nlow_y={poses['low_y']}\nhigh_y={poses['high_y']}\n")
+            f.write(f"{SCENARIO}\nZ={poses['Z']}\nY={poses['Y']}\nroute_seed={ROUTE_SEED}\n")
 
-        # === 行人：導航網格取點 + 暖身驗證 + 整輪重生 ===
-        for attempt in range(1, MAX_ATTEMPTS + 1):
-            print(f"\n🎲 產生行人配置 (第 {attempt}/{MAX_ATTEMPTS} 次嘗試)...")
-            configs = make_pedestrian_configs_nav(world, n=3)
-            if configs is None:
-                continue
-            active_pedestrians = spawn_and_validate_pedestrians(world, blueprint_library, configs)
-            if active_pedestrians:
-                break
-            active_pedestrians = []
-
-        if not active_pedestrians:
-            raise RuntimeError(f"[{SCENARIO}] 多次嘗試後仍無法生成『會走且兩車都看得到』的行人；"
-                               "請確認 SCENARIOS 裡該場景的 view_x / low_y / high_y 範圍，"
-                               "或放寬 MIN_SHARED_VIS_RATIO / MAX_VIEW_DIST。")
+        # === 行人：固定路徑 (四個場景共用；同一 route-seed 軌跡完全相同) ===
+        routes = make_fixed_routes(ROUTE_SEED)
+        active_pedestrians = spawn_fixed_pedestrians(world, blueprint_library, routes)
+        with open(os.path.join(output_path_ego, 'pedestrian_routes.txt'), 'w', encoding='utf-8') as f:
+            for r in routes:
+                f.write(f"{r['id']} waypoints={r['waypoints']} speed={r['speed']} delay={r['delay']}\n")
 
         # === 感測器 (兩車相同 tick，維持同步) ===
         sensor_queue = Queue()
@@ -431,15 +422,8 @@ def main():
             else:
                 world.wait_for_tick()
 
-            for ped_info in active_pedestrians:
-                if not ped_info["is_finished"]:
-                    cur = ped_info["actor"].get_location()
-                    tgt = ped_info["destination"]
-                    if math.sqrt((cur.x - tgt.x) ** 2 + (cur.y - tgt.y) ** 2) < 1.5:
-                        ped_info["ai_controller"].stop()
-                        ped_info["actor"].apply_control(carla.WalkerControl(direction=carla.Vector3D(0, 0, 0), speed=0.0, jump=False))
-                        ped_info["is_finished"] = True
-                        print(f"🚦 行人 {ped_info['name']} 已抵達目的地，停止移動。")
+            # ★ 固定路徑行人控制 (錄影開始後的模擬時間)
+            update_walkers(active_pedestrians, tick_count * FIXED_DELTA)
 
             if active_pedestrians and all(ped["is_finished"] for ped in active_pedestrians):
                 print("\n🎉 所有行人皆已抵達目的地！準備結束並存檔...")
@@ -478,10 +462,6 @@ def main():
                 client.apply_batch([carla.command.DestroyActor(p["actor"]) for p in active_pedestrians if "actor" in p])
             for sensor in sensors_list:
                 sensor.destroy()
-            for p in active_pedestrians:
-                ai = p.get("ai_controller")
-                if ai is not None:
-                    ai.stop(); ai.destroy()
             print("✅ 實體清理完畢")
         except Exception as e:
             print(f"⚠️ 清理實體時發生部分錯誤 (可忽略): {e}")
