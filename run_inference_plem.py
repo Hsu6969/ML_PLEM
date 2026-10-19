@@ -139,10 +139,14 @@ def run_plem_inference(input_folder, output_folder, base_dir):
                 data_ped['predict_lon'].values
             )
 
+            # ★ 只保留該車確實偵測到行人的列 (inside/outside == 1)
+            n_before = len(data_ped)
+            data_ped = data_ped[data_ped['inside/outside'] == 1]
+
             # 輸出檔案
             out_name = f'inference_GPS_{car_id}_{ped_id}.csv'
             data_ped.to_csv(os.path.join(output_folder, out_name), index=False)
-            print(f" ✅ 完成! (輸出: {out_name})")
+            print(f" ✅ 完成! (輸出: {out_name}，保留 {len(data_ped)}/{n_before} 列)")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

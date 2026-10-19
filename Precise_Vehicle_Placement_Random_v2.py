@@ -13,6 +13,7 @@ from datetime import datetime
 import sys
 import numpy as np
 import cv2
+import faulthandler
 
 # ============================================================
 # 全域資料容器
@@ -21,6 +22,7 @@ image_count = 0
 gnss_data_Z, gnss_data_Y = [], []
 imu_data_Z, imu_data_Y = [], []
 pedestrians_data_list = []
+BASE_FRAME = None   # ★ 本輪起始的 CARLA frame；所有 frame 都減掉它，讓每輪從 0 開始
 
 # ============================================================
 # ★ 車輛場景設定 (程式內仍沿用 Z / Y 命名：代號第 1 個字母 = Z 車，第 2 個 = Y 車)
@@ -64,6 +66,7 @@ JUMP_COOLDOWN = 1.0    # 兩次跨步至少間隔幾秒
 STEP_UP_HEIGHT = 0.25  # ★ 跨上台階時往上抬的高度 (m)；人行道台階約 0.15~0.2 m
 STEP_UP_FORWARD = 0.35 # ★ 同時往前移的距離 (m)，約半步
 SAVE_SIZE = 1280  
+HANG_SECONDS = 120   # ★ 超過這麼久沒有推進模擬，就印出卡住位置並強制結束 (讓 auto_pipeline 重試)
 
 # ============================================================
 # 參數解析：輸出資料夾 (位置參數) + --scenario
@@ -131,6 +134,28 @@ def make_fixed_routes(route_seed):
         print(f"   {r['id']}: {path}  speed={r['speed']} m/s  delay={r['delay']} s")
     return routes
 
+ROUTE_SET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "route_sets.json")
+
+def load_route_set(route_seed):
+    """★ 從行人軌跡設定集 (route_sets.json) 讀取第 route_seed 組路線；
+       檔案不存在或沒有這一組時回傳 None，改用 make_fixed_routes() 即時產生。"""
+    if route_seed <= 0 or not os.path.exists(ROUTE_SET_FILE):
+        return None
+    import json
+    sets = json.load(open(ROUTE_SET_FILE, encoding="utf-8"))
+    if str(route_seed) not in sets:
+        print(f"⚠️ 軌跡設定集中沒有第 {route_seed} 組 (共 {len(sets)} 組)，改用種子即時產生")
+        return None
+    routes = []
+    for r in sets[str(route_seed)]:
+        routes.append({"id": r["id"], "bp": r["bp"],
+                       "waypoints": [tuple(p) for p in r["waypoints"]],
+                       "speed": r["speed"], "delay": r["delay"]})
+    print(f"🚶 使用軌跡設定集第 {route_seed} 組:")
+    for r in routes:
+        path = " → ".join(f"({x:.1f},{y:.1f})" for x, y in r["waypoints"])
+        print(f"   {r['id']}: {path}  speed={r['speed']} m/s  delay={r['delay']} s")
+    return routes
 
 def _destroy_peds(active):
     for p in active:
@@ -246,12 +271,13 @@ def save_resized(image, path):
     cv2.imwrite(path, arr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
 
 def sensor_callback(sensor_data, sensor_queue, sensor_name):
-    global image_count
+    global image_count, BASE_FRAME
+    rel_frame = sensor_data.frame - BASE_FRAME          # ★ 相對 frame (每輪從 0 開始)
     if sensor_name == 'camera_Z':
         image_count += 1
-        save_resized(sensor_data, os.path.join(output_path_image_Z, '%06d.png' % sensor_data.frame))
+        save_resized(sensor_data, os.path.join(output_path_image_Z, '%06d.png' % rel_frame))
     elif sensor_name == 'camera_Y':
-        save_resized(sensor_data, os.path.join(output_path_image_Y, '%06d.png' % sensor_data.frame))
+        save_resized(sensor_data, os.path.join(output_path_image_Y, '%06d.png' % rel_frame))
     elif sensor_name == 'gnss_Z':
         gnss_data_Z.append([sensor_data.longitude, sensor_data.latitude])
     elif sensor_name == 'gnss_Y':
@@ -260,7 +286,7 @@ def sensor_callback(sensor_data, sensor_queue, sensor_name):
         imu_data_Z.append([sensor_data.compass])
     elif sensor_name == 'imu_Y':
         imu_data_Y.append([sensor_data.compass])
-    sensor_queue.put((sensor_data.frame, sensor_name))
+    sensor_queue.put((rel_frame, sensor_name))
 
 
 def parser():
@@ -269,6 +295,7 @@ def parser():
 
 def main():
     args = parser()
+    faulthandler.dump_traceback_later(300, exit=True)   # 初始化 (載入地圖、生成車與行人) 最多 5 分鐘
     actors_list = []
     sensors_list = []
     active_pedestrians = []
@@ -350,7 +377,7 @@ def main():
             f.write(f"{SCENARIO}\nZ={poses['Z']}\nY={poses['Y']}\nroute_seed={ROUTE_SEED}\n")
 
         # === 行人：固定路徑 (四個場景共用；同一 route-seed 軌跡完全相同) ===
-        routes = make_fixed_routes(ROUTE_SEED)
+        routes = load_route_set(ROUTE_SEED) or make_fixed_routes(ROUTE_SEED)
         active_pedestrians = spawn_fixed_pedestrians(world, blueprint_library, routes)
         with open(os.path.join(output_path_ego, 'pedestrian_routes.txt'), 'w', encoding='utf-8') as f:
             for r in routes:
@@ -385,6 +412,12 @@ def main():
         camera_Y = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle_Y)
         camera_Y.listen(lambda d: sensor_callback(d, sensor_queue, "camera_Y")); sensors_list.append(camera_Y)
 
+        # ★ 設定本輪的 frame 起點：下一次 world.tick() 產生的 frame 編號就是 0
+        global BASE_FRAME
+        BASE_FRAME = world.get_snapshot().frame + 1
+        print(f"⏱️ 本輪 frame 從 0 開始 (CARLA 原始 frame {BASE_FRAME} = 0)")
+        with open(os.path.join(output_path_ego, 'scenario.txt'), 'a', encoding='utf-8') as f:
+            f.write(f"base_frame={BASE_FRAME}\n")
         # === 主迴圈 ===
         max_ticks = int(MAX_SIM_SECONDS / FIXED_DELTA)
         tick_count = 0
@@ -397,10 +430,12 @@ def main():
 
             if args.sync and synchronous_master:
                 world.tick()
+                faulthandler.dump_traceback_later(HANG_SECONDS, exit=True)   # ★ 每推進一步就重新計時
                 tick_count += 1
                 try:
                     for i in range(0, len(sensors_list)):
-                        s_frame = sensor_queue.get(True, 1.0)
+                        # ★ 第一筆只等 0.3 秒 (沒資料的步數很快跳過)；有資料時其餘幾筆最多等 2 秒
+                        s_frame = sensor_queue.get(True, 0.3 if i == 0 else 2.0)
                         camera_frame = s_frame[0]
                         if s_frame[1] == "camera_Z":
                             geo_Z = carla_map.transform_to_geolocation(vehicle_Z.get_location())
@@ -434,6 +469,7 @@ def main():
                 break
 
     finally:
+        faulthandler.cancel_dump_traceback_later()
         print("\n=== 開始收尾與存檔 ===")
         try:
             print("...寫檔中...")
